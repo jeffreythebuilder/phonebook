@@ -25,7 +25,16 @@ sudo curl -fsSL \
   https://raw.githubusercontent.com/jeffreythebuilder/phonebook/main/configure-phonebook-auth \
   -o /usr/local/sbin/configure-phonebook-auth
 
+Set ownership and permissions:
+sudo chown root:root /usr/local/sbin/configure-phonebook-auth
 sudo chmod 750 /usr/local/sbin/configure-phonebook-auth
+
+Create the initial Apache configuration directory
+sudo mkdir -p /etc/apache2/conf-available
+sudo touch /etc/apache2/conf-available/phonebook-security.conf
+
+This is required only for the first installation with the current installer.
+Run the installer
 sudo /usr/local/sbin/configure-phonebook-auth
 The installer asks for:
 1. Phone type:

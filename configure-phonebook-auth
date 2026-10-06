@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+umask 077
+
+readonly AUTH_FILE="/etc/apache2/phonebook.htpasswd"
+readonly APACHE_CONFIG="/etc/apache2/conf-available/phonebook-security.conf"
+readonly BACKUP_DIR="/root/phonebook-backups"
+readonly PHONEBOOK_FILE="/var/www/html/phonebook.php"
+readonly PHONEBOOK_URL="https://raw.githubusercontent.com/jeffreythebuilder/phonebook/8b7a83ccaabb1a18284b53932ea076f8275ac90c/phonebook.php"
+
+fail() { echo "Error: $*" >&2; exit 1; }
+[[ $EUID -eq 0 ]] || fail "Run this script as root."
+[[ -f $APACHE_CONFIG ]] || fail "Missing $APACHE_CONFIG"
+
+for command in htpasswd a2enconf a2disconf apache2ctl systemctl openssl curl php install python3; do
+    command -v "$command" >/dev/null 2>&1 || fail "Required command not found: $command"
+done
+
+default_host="$(hostname -I 2>/dev/null | awk '{print $1}')"
+[[ -n $default_host ]] || default_host="pbx.example.com"
+
+echo "Configure the shared Digium/Alcatel phonebook"
+echo
+echo "1) Alcatel only (HTTPS)"
+echo "2) Digium only (HTTP, restricted to a network)"
+echo "3) Both Alcatel and Digium"
+read -r -p "Phone types [3]: " phone_mode
+phone_mode="${phone_mode:-3}"
+[[ $phone_mode =~ ^[123]$ ]] || fail "Choose 1, 2, or 3."
+
+read -r -p "Contact Manager group [Demo_1]: " contact_manager_group
+contact_manager_group="${contact_manager_group:-Demo_1}"
+[[ $contact_manager_group =~ ^[A-Za-z0-9_.[:space:]-]+$ ]] || \
+    fail "Contact Manager group may contain only letters, numbers, spaces, ., _, and -."
+
+if [[ $phone_mode == 2 || $phone_mode == 3 ]]; then
+    read -r -p "Allowed Digium IPv4 networks, comma-separated (example 192.168.188.0/24): " digium_networks
+    digium_networks="${digium_networks//,/ }"
+    [[ -n $digium_networks ]] || fail "At least one Digium IP or subnet is required."
+    digium_networks="$(DIGIUM_NETWORKS="$digium_networks" python3 - <<'PY'
+import ipaddress, os, sys
+result = []
+for value in os.environ['DIGIUM_NETWORKS'].split():
+    try:
+        result.append(str(ipaddress.ip_network(value, strict=False)))
+    except ValueError:
+        print('Invalid IP network: ' + value, file=sys.stderr)
+        sys.exit(1)
+print(' '.join(result))
+PY
+    )" || fail "Invalid Digium IP network."
+    echo "Validated Digium networks: $digium_networks"
+fi
+
+echo
+echo "Downloading phonebook.php from the pinned GitHub commit..."
+downloaded_phonebook="$(mktemp /tmp/phonebook.php.XXXXXX)"
+cleanup_download() { rm -f "$downloaded_phonebook"; }
+trap cleanup_download EXIT
+curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+    --max-time 30 --output "$downloaded_phonebook" "$PHONEBOOK_URL" \
+    || fail "Could not download phonebook.php from GitHub."
+php -l "$downloaded_phonebook" >/dev/null || fail "Downloaded phonebook.php failed PHP syntax validation."
+grep -q 'CompanyIPPhoneDirectory' "$downloaded_phonebook" || fail "Downloaded file lacks Digium support."
+grep -q 'PhoneDirectory' "$downloaded_phonebook" || fail "Downloaded file lacks Alcatel support."
+CONTACT_MANAGER_GROUP="$contact_manager_group" DOWNLOADED_PHONEBOOK="$downloaded_phonebook" python3 - <<'PY'
+import os, re, sys
+from pathlib import Path
+
+path = Path(os.environ['DOWNLOADED_PHONEBOOK'])
+text = path.read_text()
+group = os.environ['CONTACT_MANAGER_GROUP']
+pattern = r'(\$contact_manager_group\s*=\s*isset\(\$_GET\[\'cgroup\'\]\)\s*\?\s*\$_GET\[\'cgroup\'\]\s*:\s*)"[^"]*"'
+updated, count = re.subn(pattern, lambda match: match.group(1) + '"' + group + '"', text, count=1)
+if count != 1:
+    print('Could not locate the Contact Manager group setting.', file=sys.stderr)
+    sys.exit(1)
+path.write_text(updated)
+PY
+echo "Downloaded and syntax-checked commit 8b7a83ccaabb1a18284b53932ea076f8275ac90c."
+
+read -r -p "Directory username [phonebook]: " username
+username="${username:-phonebook}"
+[[ $username =~ ^[A-Za-z0-9._~-]+$ ]] || fail "Username contains unsupported characters."
+
+while true; do
+    read -r -s -p "Directory password (blank generates one): " password
+    echo
+    if [[ -z $password ]]; then
+        # Digium A-series phonebook credentials support at most 16 characters.
+        password="$(openssl rand -hex 8)"
+        generated_password=true
+        break
+    fi
+    generated_password=false
+    [[ ${#password} -ge 8 ]] || { echo "Use at least 8 characters." >&2; continue; }
+    if [[ $phone_mode == 2 || $phone_mode == 3 ]]; then
+        [[ ${#password} -le 16 ]] || { echo "Digium passwords must be no more than 16 characters." >&2; continue; }
+    fi
+    [[ $password =~ ^[A-Za-z0-9._~-]+$ ]] || { echo "Use URL-safe characters only." >&2; continue; }
+    read -r -s -p "Confirm directory password: " confirmation
+    echo
+    [[ $password == "$confirmation" ]] || { echo "Passwords do not match." >&2; continue; }
+    unset confirmation
+    break
+done
+
+read -r -p "PBX hostname or IP [$default_host]: " directory_host
+directory_host="${directory_host:-$default_host}"
+directory_host="${directory_host#https://}"
+directory_host="${directory_host#http://}"
+directory_host="${directory_host%%/*}"
+[[ -n $directory_host && $directory_host != *' '* && $directory_host != *'@'* ]] || fail "Enter only a hostname or IP address."
+
+alcatel_url="https://${username}:${password}@${directory_host}/phonebook.php?format=alcatel"
+digium_url="http://${directory_host}:2001/phonebook.php?format=digium"
+(( ${#alcatel_url} <= 127 )) || fail "The Alcatel URL exceeds the tested M3s 127-character limit."
+
+mkdir -p "$BACKUP_DIR"
+chmod 700 "$BACKUP_DIR"
+timestamp="$(date +%Y%m%d-%H%M%S)"
+[[ -f $PHONEBOOK_FILE ]] && cp -a "$PHONEBOOK_FILE" "$BACKUP_DIR/phonebook.php.$timestamp"
+[[ -f $AUTH_FILE ]] && cp -a "$AUTH_FILE" "$BACKUP_DIR/phonebook.htpasswd.$timestamp"
+
+apache_group="$(ps -eo comm=,egroup= | awk '$1 == "apache2" && $2 != "root" {print $2; exit}')"
+if [[ -z $apache_group ]] || ! getent group "$apache_group" >/dev/null; then apache_group="asterisk"; fi
+getent group "$apache_group" >/dev/null || fail "Cannot determine Apache worker group."
+
+temporary_auth="$(mktemp /etc/apache2/.phonebook.htpasswd.XXXXXX)"
+temporary_config="$(mktemp /etc/apache2/.phonebook-security.conf.XXXXXX)"
+cleanup() { rm -f "$temporary_auth" "$temporary_config" "$downloaded_phonebook"; }
+trap cleanup EXIT
+printf '%s\n' "$password" | htpasswd -i -B -c "$temporary_auth" "$username" >/dev/null 2>&1
+chown root:"$apache_group" "$temporary_auth"
+chmod 640 "$temporary_auth"
+
+{
+    echo '<Directory "/var/www/html">'
+    echo '    <Files "phonebook.php">'
+    echo '        AuthType Basic'
+    echo '        AuthName "Phone Directory"'
+    echo '        AuthBasicProvider file'
+    echo "        AuthUserFile $AUTH_FILE"
+    echo '        <RequireAny>'
+    if [[ $phone_mode == 1 || $phone_mode == 3 ]]; then
+        echo "            <RequireAll>"
+        echo "                Require expr %{HTTPS} == 'on'"
+        echo '                Require valid-user'
+        echo '            </RequireAll>'
+    fi
+    if [[ $phone_mode == 2 || $phone_mode == 3 ]]; then
+        echo '            <RequireAll>'
+        echo "                Require ip $digium_networks"
+        echo '                Require valid-user'
+        echo '            </RequireAll>'
+    fi
+    echo '        </RequireAny>'
+    echo '    </Files>'
+    echo '</Directory>'
+} > "$temporary_config"
+
+mv -f "$temporary_auth" "$AUTH_FILE"
+install -o root -g root -m 0644 "$temporary_config" "$APACHE_CONFIG"
+install -o root -g root -m 0644 "$downloaded_phonebook" "$PHONEBOOK_FILE"
+
+a2enconf phonebook-security >/dev/null
+if ! apache2ctl configtest; then
+    a2disconf phonebook-security >/dev/null || true
+    fail "Apache rejected the generated configuration."
+fi
+systemctl reload apache2
+
+echo
+echo "Phonebook deployment completed."
+echo "Apache password file: $AUTH_FILE"
+if [[ $phone_mode == 1 || $phone_mode == 3 ]]; then
+    echo "Alcatel M3s URL: $alcatel_url"
+fi
+if [[ $phone_mode == 2 || $phone_mode == 3 ]]; then
+    echo "Digium URL: $digium_url"
+    echo "Digium username: $username"
+    echo "Digium password: $password"
+    echo "Digium allowed networks: $digium_networks"
+    echo "Configure the Digium XML-PBook Auth field with the displayed credentials."
+fi
+echo
+echo "HTTP Digium access requires both a valid credential and an allowed source IP."
+echo "HTTPS Alcatel access requires a valid credential."
+echo "Credentials are not stored in phonebook.php."
+unset password alcatel_url digium_url

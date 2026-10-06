@@ -11,7 +11,7 @@ readonly PHONEBOOK_URL="https://raw.githubusercontent.com/jeffreythebuilder/phon
 
 fail() { echo "Error: $*" >&2; exit 1; }
 [[ $EUID -eq 0 ]] || fail "Run this script as root."
-[[ -f $APACHE_CONFIG ]] || fail "Missing $APACHE_CONFIG"
+mkdir -p "$(dirname "$APACHE_CONFIG")"
 
 for command in htpasswd a2enconf a2disconf apache2ctl systemctl openssl curl php install python3; do
     command -v "$command" >/dev/null 2>&1 || fail "Required command not found: $command"
@@ -78,6 +78,7 @@ if count != 1:
     sys.exit(1)
 path.write_text(updated)
 PY
+php -l "$downloaded_phonebook" >/dev/null || fail "Modified phonebook.php failed PHP syntax validation."
 echo "Downloaded and syntax-checked commit 8b7a83ccaabb1a18284b53932ea076f8275ac90c."
 
 read -r -p "Directory username [phonebook]: " username

@@ -22,7 +22,7 @@ Download and run the installer as root:
 
 ```bash
 sudo curl -fsSL \
-  https://raw.githubusercontent.com/USERNAME/REPOSITORY/COMMIT/configure-phonebook-auth \
+  https://raw.githubusercontent.com/jeffreythebuilder/phonebook/main/configure-phonebook-auth \
   -o /usr/local/sbin/configure-phonebook-auth
 
 sudo chmod 750 /usr/local/sbin/configure-phonebook-auth

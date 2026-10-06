@@ -9,7 +9,7 @@ The endpoint automatically returns the correct XML format based on the request.
 
 ## Requirements
 
-- FreePBX/Debian-based PBX
+- FreePBX/Debian-based PBX (17)
 - Apache 2
 - PHP
 - HTTPS configured for Alcatel phones

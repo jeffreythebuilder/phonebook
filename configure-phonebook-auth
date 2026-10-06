@@ -29,10 +29,34 @@ read -r -p "Phone types [3]: " phone_mode
 phone_mode="${phone_mode:-3}"
 [[ $phone_mode =~ ^[123]$ ]] || fail "Choose 1, 2, or 3."
 
-read -r -p "Contact Manager group [Demo_1]: " contact_manager_group
-contact_manager_group="${contact_manager_group:-Demo_1}"
-[[ $contact_manager_group =~ ^[A-Za-z0-9_.[:space:]-]+$ ]] || \
-    fail "Contact Manager group may contain only letters, numbers, spaces, ., _, and -."
+contact_groups="$(php <<'PHP'
+<?php
+require_once('/etc/freepbx.conf');
+global $db;
+$rows = $db->getAll('SELECT name FROM contactmanager_groups ORDER BY name');
+if (DB::IsError($rows)) {
+    exit(1);
+}
+foreach ($rows as $row) {
+    echo $row[0], PHP_EOL;
+}
+PHP
+)" || fail "Could not read Contact Manager groups from FreePBX."
+
+[[ -n $contact_groups ]] || fail "No Contact Manager groups were found. Create one in FreePBX first."
+mapfile -t contact_group_list <<< "$contact_groups"
+echo
+echo "Available Contact Manager groups:"
+for index in "${!contact_group_list[@]}"; do
+    printf '  %d) %s\n' "$((index + 1))" "${contact_group_list[$index]}"
+done
+read -r -p "Select Contact Manager group [1]: " contact_group_choice
+contact_group_choice="${contact_group_choice:-1}"
+[[ $contact_group_choice =~ ^[0-9]+$ ]] || fail "Choose a group number."
+(( contact_group_choice >= 1 && contact_group_choice <= ${#contact_group_list[@]} )) || \
+    fail "Choose a number from the displayed group list."
+contact_manager_group="${contact_group_list[$((contact_group_choice - 1))]}"
+echo "Selected Contact Manager group: $contact_manager_group"
 
 if [[ $phone_mode == 2 || $phone_mode == 3 ]]; then
     read -r -p "Allowed Digium IPv4 networks, comma-separated (example 192.168.188.0/24): " digium_networks
